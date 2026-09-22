@@ -4,12 +4,12 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.SpringBootTest;
 
 /**
- * @author Vincent
- * @version 1.0
+ * 应用上下文冒烟测试：默认配置下 Spring 容器可正常启动（含定时任务装配与配置校验）。
  */
 @SpringBootTest
-public class ApplicationTests {
+class ApplicationTests {
+
     @Test
-    public void contentLoad() {
+    void contextLoads() {
     }
 }
