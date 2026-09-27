@@ -124,4 +124,51 @@ class LeaseControllerIntegrationTest {
                 .andExpect(jsonPath("$.code").value("NOT_OWNER"))
                 .andDo(r -> log.info("跨所有者续租 -> 409: {}", r.getResponse().getContentAsString()));
     }
+
+    @Test
+    @DisplayName("HTTP 转让：成功易主、重复提交同一结论、冲突键 409/TRANSFER_REQUEST_CONFLICT、原主人被挡")
+    void httpTransferIdempotencyAndConflict() throws Exception {
+        MvcResult created = mvc().perform(post("/api/leases")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(applyJson("http-tx-1", "alice", "payments")))
+                .andExpect(status().isCreated()).andReturn();
+        String id = om.readTree(created.getResponse().getContentAsString()).get("id").asText();
+
+        String transferBody = """
+                {"transferRequestId":"tx-http-1","operator":"alice","targetOwner":"bob","targetTeam":"settlements"}
+                """;
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(transferBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(id))
+                .andExpect(jsonPath("$.owner").value("bob"))
+                .andExpect(jsonPath("$.team").value("settlements"))
+                .andExpect(jsonPath("$.status").value("READY"))
+                .andDo(r -> log.info("HTTP 转让成功: {}", r.getResponse().getContentAsString()));
+
+        // 重复提交：同一结论（仍是 bob，资源不重建）
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(transferBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.owner").value("bob"));
+
+        // 同一键改用于另一个目标 -> 409 且 errorCode 可区分，消息里带此前用途
+        String conflictBody = """
+                {"transferRequestId":"tx-http-1","operator":"bob","targetOwner":"carol","targetTeam":"infra"}
+                """;
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(conflictBody))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("TRANSFER_REQUEST_CONFLICT"))
+                .andExpect(jsonPath("$.message").value(org.hamcrest.Matchers.containsString(id)))
+                .andDo(r -> log.info("HTTP 转让冲突 -> 409: {}", r.getResponse().getContentAsString()));
+
+        // 原主人再操作被挡
+        mvc().perform(post("/api/leases/{id}/renew", id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"operator":"alice","extension":"PT5M"}"""))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("NOT_OWNER"));
+    }
 }

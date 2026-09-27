@@ -22,8 +22,8 @@ public class Lease {
 
     private final String id;
     private final String requestId;
-    private final String owner;
-    private final String team;
+    private String owner;
+    private String team;
     private final Instant createdAt;
     private final Duration ttl;
     private final int maxAttempts;
@@ -168,5 +168,46 @@ public class Lease {
             return true;
         }
         return false;
+    }
+
+    // ---------------------------------------------------------------- 转让
+
+    /**
+     * 拷贝构造：生成转让生效时刻的快照，供转让幂等回执回放使用。
+     * 快照独立于原聚合：之后原租约被续租/终止/过期都不影响已提交的回放结论；
+     * 失败历史做防御性拷贝，避免内外共享可变列表。
+     */
+    public Lease(Lease other) {
+        this.id = other.id;
+        this.requestId = other.requestId;
+        this.owner = other.owner;
+        this.team = other.team;
+        this.createdAt = other.createdAt;
+        this.ttl = other.ttl;
+        this.maxAttempts = other.maxAttempts;
+        this.status = other.status;
+        this.lastStatusChangedAt = other.lastStatusChangedAt;
+        this.expiresAt = other.expiresAt;
+        this.endpoint = other.endpoint;
+        this.resourceSlot = other.resourceSlot;
+        this.attemptCount = other.attemptCount;
+        this.failures.addAll(other.failures);
+        this.quotaHeld = other.quotaHeld;
+    }
+
+    /**
+     * 原地易主：仅 READY 可转让。环境不重建、实例/资源槽/endpoint/到期时间均不变，
+     * 配额占用标志也不变（占用的“那个”配额由账本在同一临界区从源迁到目标）。
+     */
+    public void transferTo(String newOwner, String newTeam, Instant at) {
+        if (status != LeaseStatus.READY) {
+            throw new IllegalStateException("仅 READY 租约可转让，当前=" + status);
+        }
+        if (newOwner == null || newOwner.isBlank() || newTeam == null || newTeam.isBlank()) {
+            throw new IllegalArgumentException("转让目标 owner/team 不能为空");
+        }
+        this.owner = newOwner;
+        this.team = newTeam;
+        this.lastStatusChangedAt = at;
     }
 }

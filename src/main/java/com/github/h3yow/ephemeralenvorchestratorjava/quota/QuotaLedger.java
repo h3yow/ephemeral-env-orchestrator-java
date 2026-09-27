@@ -78,4 +78,34 @@ public class QuotaLedger {
         teamUsed.forEach((k, v) -> views.put(k, new QuotaView(v, teamLimit)));
         return views;
     }
+
+    /**
+     * 转让配额水位迁移：源归属释放一个、目标归属占用一个，按维度实际差异增减，
+     * owner 相同或 team 相同时该维度不计数（不重复 +1/-1），因此：
+     * <ul>
+     *   <li>owner 与 team 都不同：源 owner/team 各 -1，目标 owner/team 各 +1；</li>
+     *   <li>仅 owner 变化（同一团队内换人）：只动 owner 维度，团队水位保持不变；</li>
+     *   <li>仅 team 变化（同一人换团队）：只动 team 维度，个人水位保持不变；</li>
+     *   <li>owner 与 team 都相同（自己转自己）：两边都不动，不可能凭空增减配额。</li>
+     * </ul>
+     * 必须由编排服务在全局锁内、且已通过目标配额检查后调用，
+     * 与租约归属变更在同一临界区一次性生效，杜绝半更新状态。
+     */
+    public void moveOwnership(String fromOwner, String fromTeam,
+                              String toOwner, String toTeam) {
+        if (!fromOwner.equals(toOwner)) {
+            long from = ownerUsed.getOrDefault(fromOwner, 0L);
+            if (from > 0) {
+                ownerUsed.put(fromOwner, from - 1);
+            }
+            ownerUsed.merge(toOwner, 1L, Long::sum);
+        }
+        if (!fromTeam.equals(toTeam)) {
+            long from = teamUsed.getOrDefault(fromTeam, 0L);
+            if (from > 0) {
+                teamUsed.put(fromTeam, from - 1);
+            }
+            teamUsed.merge(toTeam, 1L, Long::sum);
+        }
+    }
 }

@@ -23,5 +23,9 @@ public enum ErrorCode {
     OWNER_QUOTA_EXCEEDED,
     TEAM_QUOTA_EXCEEDED,
     RESOURCE_INSUFFICIENT,
+    /** 转让时环境当前状态不允许转让（非 READY 且非终态，如供给中/失败中）。 */
+    TRANSFER_NOT_ALLOWED,
+    /** 转让幂等键冲突：同一 transferRequestId 此前已用于另一条环境或另一个目标归属。 */
+    TRANSFER_REQUEST_CONFLICT,
     CLOCK_ROLLBACK_DETECTED
 }

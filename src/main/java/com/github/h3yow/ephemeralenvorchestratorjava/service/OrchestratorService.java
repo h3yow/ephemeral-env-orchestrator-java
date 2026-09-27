@@ -5,6 +5,7 @@ import com.github.h3yow.ephemeralenvorchestratorjava.domain.FailureCode;
 import com.github.h3yow.ephemeralenvorchestratorjava.domain.FailureRecord;
 import com.github.h3yow.ephemeralenvorchestratorjava.domain.Lease;
 import com.github.h3yow.ephemeralenvorchestratorjava.domain.LeaseStatus;
+import com.github.h3yow.ephemeralenvorchestratorjava.domain.TransferReceipt;
 import com.github.h3yow.ephemeralenvorchestratorjava.error.BusinessException;
 import com.github.h3yow.ephemeralenvorchestratorjava.error.ErrorCode;
 import com.github.h3yow.ephemeralenvorchestratorjava.lease.LeaseRepository;
@@ -16,6 +17,7 @@ import com.github.h3yow.ephemeralenvorchestratorjava.time.TimeSource;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.ApplyLeaseRequest;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.LeaseView;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.RenewRequest;
+import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.TransferLeaseRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -89,6 +91,11 @@ public class OrchestratorService {
                         request.getRequestId(), request.getOwner(), request.getTeam(), ttl,
                         existing.getId(), existing.getStatus());
                 return LeaseView.from(existing);
+            }
+            if (repository.existsTransfer(request.getRequestId())) {
+                throw new BusinessException(ErrorCode.TRANSFER_REQUEST_CONFLICT,
+                        "申请幂等键冲突：requestId=" + request.getRequestId()
+                                + " 此前已用作转让幂等键，申请与转让的幂等键不得混用");
             }
             enforceQuota(request.getOwner(), request.getTeam());
 
@@ -253,8 +260,157 @@ public class OrchestratorService {
         return view;
     }
 
-    // ------------------------------------------------------------------ 重试
+    // ------------------------------------------------------------------ 转让
 
+    /**
+     * 转让/接手（幂等）：当前 owner 把一条 READY 未到期环境原地转给新 owner/team。
+     *
+     * <p>全部判定与写入在同一把全局锁内一次完成：
+     * <ol>
+     *   <li>幂等回放：transferRequestId 命中且 lease/目标归属完全一致 -> 返回生效时刻快照，
+     *       不重复迁移配额；租约或目标不同 -> TRANSFER_REQUEST_CONFLICT，并说明此前用在哪；</li>
+     *   <li>归属校验：发起人必须是当前 owner（NOT_OWNER）；</li>
+     *   <li>状态校验：TERMINATED/EXPIRED 给出各自独立原因；其它非 READY -> TRANSFER_NOT_ALLOWED；
+     *       READY 但已到期 -> 与续租路径相同的原子回收，并以 LEASE_ALREADY_EXPIRED 拒绝；</li>
+     *   <li>目标配额：只检查真正发生变化的维度，源占用不重计；不足给出 OWNER/TEAM 各自原因；</li>
+     *   <li>一次性生效：账本水位迁移、租约易主、幂等回执落库同一临界区，要么全做要么全不做。</li>
+     * </ol>
+     */
+    public LeaseView transfer(String leaseId, TransferLeaseRequest request) {
+        String slotToRelease = null;
+        BusinessException deferred = null;
+        LeaseView view = null;
+        lock.lock();
+        try {
+            Instant now = currentTimeForMutation();
+            validateTransferRequest(request);
+            String transferId = request.getTransferRequestId();
+
+            // 1) 幂等索引优先：无论租约之后处于什么状态，重复提交拿到的都是同一生效时刻结论
+            TransferReceipt receipt = repository.findTransfer(transferId);
+            if (receipt != null) {
+                if (receipt.leaseId().equals(leaseId)
+                        && receipt.toOwner().equals(request.getTargetOwner())
+                        && receipt.toTeam().equals(request.getTargetTeam())) {
+                    log.info("转让判定[幂等命中] transferRequestId={} leaseId={} {}->{}；复用生效时刻快照，配额不再迁移",
+                            transferId, leaseId, receipt.fromOwner() + "/" + receipt.fromTeam(),
+                            receipt.toOwner() + "/" + receipt.toTeam());
+                    view = LeaseView.from(receipt.snapshot());
+                } else {
+                    throw new BusinessException(ErrorCode.TRANSFER_REQUEST_CONFLICT,
+                            "转让幂等键冲突：transferRequestId=" + transferId + " 此前已用于另一次转让"
+                                    + "（leaseId=" + receipt.leaseId()
+                                    + " " + receipt.fromOwner() + "/" + receipt.fromTeam()
+                                    + " -> " + receipt.toOwner() + "/" + receipt.toTeam()
+                                    + "，生效时间=" + receipt.transferredAt()
+                                    + "），不能改用于 leaseId=" + leaseId + " 目标="
+                                    + request.getTargetOwner() + "/" + request.getTargetTeam());
+                }
+            } else if (repository.existsRequest(transferId)) {
+                Lease prior = repository.findByRequestId(transferId).orElse(null);
+                throw new BusinessException(ErrorCode.TRANSFER_REQUEST_CONFLICT,
+                        "转让幂等键冲突：transferRequestId=" + transferId + " 此前已用作申请幂等键"
+                                + "（对应 leaseId=" + (prior == null ? "未知" : prior.getId()) + "），"
+                                + "申请与转让的幂等键不得混用");
+            } else {
+                Lease lease = requireLease(leaseId);
+                requireOwner(lease, request.getOperator());
+
+                switch (lease.getStatus()) {
+                    case TERMINATED -> throw new BusinessException(ErrorCode.LEASE_ALREADY_TERMINATED,
+                            "租约 " + leaseId + " 已终止，不能转让");
+                    case EXPIRED -> throw new BusinessException(ErrorCode.LEASE_ALREADY_EXPIRED,
+                            "租约 " + leaseId + " 已过期回收，不能转让");
+                    case READY -> { /* 继续判定到期边界与配额 */ }
+                    default -> throw new BusinessException(ErrorCode.TRANSFER_NOT_ALLOWED,
+                            "租约 " + leaseId + " 当前状态=" + lease.getStatus()
+                                    + "，仅 READY 可转让（环境须已就绪且未结束）");
+                }
+
+                // 与续租/回收一致的关键竞态裁决：到期判定与回收原子完成，已结束环境绝不允许转走
+                if (lease.isExpiredAt(now)) {
+                    expireLease(lease, now, "转让时发现已到期");
+                    repository.save(lease);
+                    slotToRelease = lease.getResourceSlot();
+                    deferred = new BusinessException(ErrorCode.LEASE_ALREADY_EXPIRED,
+                            "租约 " + leaseId + " 在 now=" + now + " 已到期（expiresAt="
+                                    + lease.getExpiresAt() + "），已原子回收，不能转让");
+                } else {
+                    String fromOwner = lease.getOwner();
+                    String fromTeam = lease.getTeam();
+                    String toOwner = request.getTargetOwner();
+                    String toTeam = request.getTargetTeam();
+                    enforceTransferTargetQuota(fromOwner, fromTeam, toOwner, toTeam);
+
+                    // 检查与迁移同一临界区：先动账本再易主，随后立即落快照回执，
+                    // 任一步失败（仅 RuntimeException）整体由调用方放弃，外部不可见半更新。
+                    ledger.moveOwnership(fromOwner, fromTeam, toOwner, toTeam);
+                    lease.transferTo(toOwner, toTeam, now);
+                    repository.save(lease);
+                    Lease snapshot = new Lease(lease);
+                    repository.saveTransfer(new TransferReceipt(
+                            transferId, leaseId, fromOwner, fromTeam, toOwner, toTeam, now, snapshot));
+                    view = LeaseView.from(snapshot);
+                    log.info("转让判定[成功] transferRequestId={} leaseId={} {}/{} -> {}/{}；"
+                                    + "实例/endpoint/到期时间不变，转让后水位 owner[{}]={},owner[{}]={} team[{}]={},team[{}]={}",
+                            transferId, leaseId, fromOwner, fromTeam, toOwner, toTeam,
+                            fromOwner, ledger.ownerView(fromOwner).used(),
+                            toOwner, ledger.ownerView(toOwner).used(),
+                            fromTeam, ledger.teamView(fromTeam).used(),
+                            toTeam, ledger.teamView(toTeam).used());
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+        if (slotToRelease != null) {
+            provisioner.release(slotToRelease);
+        }
+        if (deferred != null) {
+            throw deferred;
+        }
+        return view;
+    }
+
+    /** 持锁调用：校验转让目标配额，只检查真正变化的维度（源维度腾出的槽位不算占用）。 */
+    private void enforceTransferTargetQuota(String fromOwner, String fromTeam,
+                                            String toOwner, String toTeam) {
+        if (!fromOwner.equals(toOwner)) {
+            QuotaView targetOwnerView = ledger.ownerView(toOwner);
+            if (!targetOwnerView.isUnlimited()
+                    && targetOwnerView.used() >= targetOwnerView.limit()) {
+                throw new BusinessException(ErrorCode.OWNER_QUOTA_EXCEEDED,
+                        "转让目标所有者配额不足：owner=" + toOwner + " 已用="
+                                + targetOwnerView.used() + " 上限=" + targetOwnerView.limit());
+            }
+        }
+        if (!fromTeam.equals(toTeam)) {
+            QuotaView targetTeamView = ledger.teamView(toTeam);
+            if (!targetTeamView.isUnlimited()
+                    && targetTeamView.used() >= targetTeamView.limit()) {
+                throw new BusinessException(ErrorCode.TEAM_QUOTA_EXCEEDED,
+                        "转让目标团队配额不足：team=" + toTeam + " 已用="
+                                + targetTeamView.used() + " 上限=" + targetTeamView.limit());
+            }
+        }
+    }
+
+    private void validateTransferRequest(TransferLeaseRequest request) {
+        if (request == null) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR, "转让请求体不能为空");
+        }
+        if (isBlank(request.getTransferRequestId()) || isBlank(request.getOperator())
+                || isBlank(request.getTargetOwner()) || isBlank(request.getTargetTeam())) {
+            throw new BusinessException(ErrorCode.VALIDATION_ERROR,
+                    "transferRequestId/operator/targetOwner/targetTeam 均不能为空");
+        }
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
+    }
+
+    // ------------------------------------------------------------------ 重试
     public LeaseView retry(String leaseId, String operator) {
         Lease lease;
         lock.lock();
