@@ -20,6 +20,7 @@ public class TestHarness {
     public final OrchestratorService service;
     public final OrchestratorProperties properties;
     public final QuotaLedger ledger;
+    public final LeaseRepository repository;
 
     public TestHarness() {
         this(2L, 10L);
@@ -43,6 +44,7 @@ public class TestHarness {
         ledger = new QuotaLedger();
         ledger.configure(ownerQuota, teamQuota);
         LeaseRepository repository = new LeaseRepository();
+        this.repository = repository;
         service = new OrchestratorService(repository, ledger, provisioner, clock, properties);
     }
 }

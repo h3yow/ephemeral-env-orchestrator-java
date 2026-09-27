@@ -40,23 +40,34 @@ public class QuotaLedger {
      * 通过 {@link #ownerView}/{@link #teamView} 完成未满检查，从而保证检查与占用原子。
      */
     public void acquire(String owner, String team) {
-        synchronized (owner.intern()) {
-            ownerUsed.merge(owner, 1L, Long::sum);
-            teamUsed.merge(team, 1L, Long::sum);
-        }
+        acquireOwner(owner);
+        acquireTeam(team);
     }
 
     public void release(String owner, String team) {
-        synchronized (owner.intern()) {
-            long o = ownerUsed.getOrDefault(owner, 0L);
-            if (o > 0) {
-                ownerUsed.put(owner, o - 1);
-            }
-            long t = teamUsed.getOrDefault(team, 0L);
-            if (t > 0) {
-                teamUsed.put(team, t - 1);
-            }
-        }
+        releaseOwner(owner);
+        releaseTeam(team);
+    }
+
+    /**
+     * 单维度占用，供租约转让使用：源与目标在同一维度相同时不得调用
+     * （自己转自己不能先减后加凭空制造一个可用槽，也不能重复计数）。
+     */
+    public void acquireOwner(String owner) {
+        ownerUsed.merge(owner, 1L, Long::sum);
+    }
+
+    public void acquireTeam(String team) {
+        teamUsed.merge(team, 1L, Long::sum);
+    }
+
+    /** 单维度释放，计数已为 0 时保持 0（防御性，正常路径由调用方的维度差异判定保证不会越界）。 */
+    public void releaseOwner(String owner) {
+        ownerUsed.computeIfPresent(owner, (k, v) -> v > 0 ? v - 1 : v);
+    }
+
+    public void releaseTeam(String team) {
+        teamUsed.computeIfPresent(team, (k, v) -> v > 0 ? v - 1 : v);
     }
 
     public QuotaView ownerView(String owner) {

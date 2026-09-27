@@ -8,7 +8,7 @@
 ## 1. 快速运行
 
 ```bash
-# 构建并运行全部测试（30 个用例，覆盖并发/幂等/竞态/配额边界/配置）
+# 构建并运行全部测试（55 个用例，覆盖并发/幂等/竞态/配额边界/转让/配置）
 mvn test
 
 # 启动服务（默认端口 8080）
@@ -30,6 +30,15 @@ curl -s "localhost:8080/api/leases?requestId=req-001"
 curl -s -X POST localhost:8080/api/leases/{id}/renew     -H 'Content-Type: application/json' -d '{"operator":"alice","extension":"PT5M"}'
 curl -s -X POST localhost:8080/api/leases/{id}/terminate -H 'Content-Type: application/json' -d '{"operator":"alice"}'
 curl -s -X POST localhost:8080/api/leases/{id}/retry     -H 'Content-Type: application/json' -d '{"operator":"alice"}'
+
+# 转让 / 接手（requestId 是本次转让操作的幂等键；目标字段留空表示该维度保持不变）
+curl -s -X POST localhost:8080/api/leases/{id}/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"tr-001","operator":"alice","targetOwner":"bob","targetTeam":"payments"}'
+# 只换 owner（team 不动）
+curl -s -X POST localhost:8080/api/leases/{id}/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{"requestId":"tr-002","operator":"alice","targetOwner":"bob"}'
 
 # 配额
 curl -s localhost:8080/api/leases/quotas/owners/alice
@@ -56,7 +65,9 @@ PENDING ───────▶ PROVISIONING ───────▶ READY ─
   成功即 `READY`，失败即 `FAILED`（保留失败记录）。
 - **续租**：仅 `READY` 且未到期可续租；在**当前到期时间**基础上叠加延长时长。
 - **终止**：`PENDING/PROVISIONING/READY/FAILED` 可由**所有者**主动终止；`TERMINATED/EXPIRED` 拒绝。
-- **过期**：`READY` 在 `now >= expiresAt` 时被原子回收为 `EXPIRED`（定时扫描 + 查询惰性回收 + 续租入口内联回收，三个入口结论一致）。
+- **过期**：`READY` 在 `now >= expiresAt` 时被原子回收为 `EXPIRED`（定时扫描 + 查询惰性回收 + 续租/转让入口内联回收，各入口结论一致）。
+- **转让**：仅当前 owner 可把 `READY` 未到期的环境原地转给新 owner/team，状态保持 `READY`、
+  实例与到期时间不变，配额按维度原子搬运（详见 [2.5 节](#25-租约转让--接手环境原地易主)）。
 - **非法流转被拒绝并给出可区分原因**（见错误码表），拒绝不会改变任何状态。
 
 ### 重复提交（幂等）
@@ -64,6 +75,64 @@ PENDING ───────▶ PROVISIONING ───────▶ READY ─
 `requestId` 是调用方提供的幂等键，在全局临界区内以 `putIfAbsent` 原子登记。
 同一 `requestId` 的重复提交（无论是串行还是高并发）都返回**同一个租约**，
 只创建一次租约、只占用一次配额、只执行一次资源分配。
+
+---
+
+## 2.5 租约转让 / 接手（环境原地易主）
+
+同事休假、项目交接、团队拆并时，环境无需重建，只需把归属从一个人（或团队）挪到另一个人
+（或团队）头上：**不重新供给、不换实例，`endpoint`/资源槽/到期时间全部不变**。
+
+```
+POST /api/leases/{id}/transfer
+{"requestId":"tr-001","operator":"alice","targetOwner":"bob","targetTeam":"payments"}
+```
+
+- `operator`：发起人，**必须是租约当前 owner**，否则 `NOT_OWNER`（易主后原 owner 再操作也被挡）。
+- `targetOwner` / `targetTeam`：目标归属；**留空表示该维度保持不变**（可只换人、只换团队）。
+  两个维度都与现状相同属于空转让，以 `VALIDATION_ERROR` 拒绝。
+
+**什么状态能转**
+
+| 条件 | 结论 | errorCode |
+|---|---|---|
+| `READY` 且 `now < expiresAt` | 受理转让 | 成功 |
+| 已终止 | 拒绝 | `LEASE_ALREADY_TERMINATED` |
+| 已到期（含恰好在到期点提交） | 原子回收并拒绝，不会把已结束环境转走 | `LEASE_ALREADY_EXPIRED` |
+| `PENDING/PROVISIONING/FAILED` 等非就绪状态 | 拒绝 | `LEASE_NOT_TRANSFERABLE` |
+| 发起人不是当前 owner | 拒绝 | `NOT_OWNER` |
+| 环境不存在 | 拒绝 | `LEASE_NOT_FOUND` |
+
+**目标配额怎么判**
+
+- 转让前先在同一临界区内检查**目标 owner、目标 team** 两级配额（owner 优先），
+  任一到顶即整单拒绝：`OWNER_QUOTA_EXCEEDED` / `TEAM_QUOTA_EXCEEDED`，两边水位都不动。
+- 某一维度源与目标相同（例如只换 owner 不换 team）时，**该维度跳过**：不先减后加、不重复计数。
+- 转让生效 = 源释放 + 目标占用 + 归属改写 + 幂等登记，在同一把全局锁内一次完成，
+  因此要么整体生效、要么两边不动，不存在“只扣一边/被扣两次”的半更新状态；
+  来回转让也不会凭空把配额变多。
+- 转让成功后，**新 owner 可正常续租/终止**；原 owner 对该环境的一切操作均以 `NOT_OWNER` 拒绝。
+
+**重复提交与冲突**
+
+- 转让有自己独立的幂等键空间（`requestId` 与申请互不干扰）。同一 `requestId` 重复提交
+  （含两端几乎同时提交）只真正转让一次，所有提交拿到同一结论，目标配额只占一次；
+  重复请求中留空的目标维度按“保持当前归属”归一化后比对。
+- 同一 `requestId` 被拿去转**另一条环境**，或转给**另一个目标归属**，服务端不会悄悄回放
+  第一次的结果，而是以 `IDEMPOTENCY_KEY_CONFLICT` 明确拒绝，错误信息会说明该键此前已用于
+  哪条 leaseId、转给了谁。
+- **被拒绝的转让不消费幂等键**：同一个键随后仍可用于一次成功的转让。
+
+**并发下保证什么**
+
+转让与续租、终止、到期回收都走同一把全局锁串行裁决，任何时刻只有一个确定结论：
+
+- 已结束（TERMINATED/EXPIRED）的环境绝不可能再被转走；后来的转让拿到明确的终态拒绝码。
+- 转让未成功时，目标配额绝不被占用（“配额被吞”不可能发生）。
+- 到期边界上转让与回收并发：租约被原子回收，所有转让以 `LEASE_ALREADY_EXPIRED` 失败，
+  状态翻转全局至多一次。
+- 一轮并发压测结束后，每个 owner、每个 team 的账本占用水位都与其**名下仍存活
+  （`quotaHeld`）的环境数严格相等**，资源槽数量同样对得上（见 `TransferConcurrencyTest`）。
 
 ---
 
@@ -75,7 +144,9 @@ PENDING ───────▶ PROVISIONING ───────▶ READY ─
 |---|---|---|
 | `OWNER_QUOTA_EXCEEDED` | 所有者配额已满 | 409 |
 | `TEAM_QUOTA_EXCEEDED` | 团队配额已满（跨 owner 累计） | 409 |
-| `NOT_OWNER` | 操作者不是租约所有者（跨所有者操作） | 409 |
+| `NOT_OWNER` | 操作者不是租约所有者（跨所有者操作；转让后原 owner 再操作也是此码） | 409 |
+| `LEASE_NOT_TRANSFERABLE` | 环境当前状态不允许转让（仅 READY 未到期可转） | 409 |
+| `IDEMPOTENCY_KEY_CONFLICT` | 转让 requestId 已被另一次转让使用（换了环境或换了目标归属） | 409 |
 | `RESOURCE_INSUFFICIENT` | 配额通过但底层资源池容量不足（供给失败） | 体现在失败记录 `RESOURCE_POOL_EXHAUSTED` |
 | `INVALID_STATE_TRANSITION` / `LEASE_NOT_READY` / `LEASE_ALREADY_TERMINATED` / `LEASE_ALREADY_EXPIRED` / `RETRY_LIMIT_EXCEEDED` | 各类非法状态流转，彼此可区分 | 409 |
 | `CLOCK_ROLLBACK_DETECTED` | 检测到系统时间回拨 | 409 |
@@ -148,7 +219,8 @@ PENDING ───────▶ PROVISIONING ───────▶ READY ─
 
 - 单把公平 `ReentrantLock` 串行化所有“检查 + 状态/配额写入”临界区，结论天然一致；
 - 供给等外部动作在锁外执行，完成后再入锁裁决，避免慢供给阻塞全局；
-- requestId 幂等登记、owner/team 配额检查与计数、租约状态翻转、时钟高水位更新都在锁内；
+- requestId 幂等登记（申请与转让各一套键空间）、owner/team 配额检查与计数、
+  转让的“源释放 + 目标占用 + 归属改写”原子搬运、租约状态翻转、时钟高水位更新都在锁内；
 - 供给资源槽（模拟资源池）的获取/回收在供给器内部原子完成，编排层保证成对释放。
 
 ---
@@ -168,6 +240,10 @@ mvn test
 | `ConcurrentApplyTest` | 16 线程同一 requestId 只建一个租约/只分配一次；50 并发不同 requestId 精确不超卖 |
 | `ExpiryRenewRaceTest` | 到期边界续租 vs 回收竞态（结论确定 EXPIRED）、边界前续租确定成功、时钟回拨拒绝且不提前回收 |
 | `ProvisionFailureRetryTest` | 资源不足原因区分、失败记录保留、重试上限不静默成功、超限释放配额、**供给中并发终止无泄漏** |
+| `TransferSuccessTest` | 转让后归属/配额迁移、环境原地不变（不重新供给/不换实例）、新 owner 可续租终止且原 owner 被挡、相同维度不重复计数、往返守恒、水位对账 |
+| `TransferRejectTest` | 非归属者/目标 owner 或 team 配额满/非 READY/已终止/已到期/不存在/空转让等拒绝原因彼此可区分，且拒绝后两边水位不动 |
+| `TransferIdempotencyTest` | 同键串行与 24 线程并发只生效一次、目标配额不重复占用；同键换环境/换目标 `IDEMPOTENCY_KEY_CONFLICT` 且信息可追溯；被拒不消费键 |
+| `TransferConcurrencyTest` | 转让 vs 终止/到期回收/续租的确定结论；600 轮混合并发（申请/转让/续租/终止/回收）后逐 owner、逐 team 水位与存活环境数严格对账 |
 | `ConfigurationValidationTest` / `InvalidConfigBootRejectTest` | 默认值稳定、非法/矛盾配置启动期拒绝 |
 | `LeaseControllerIntegrationTest` | HTTP 状态码与稳定 errorCode、端到端幂等 |
 

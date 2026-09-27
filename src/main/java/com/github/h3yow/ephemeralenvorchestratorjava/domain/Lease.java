@@ -22,8 +22,8 @@ public class Lease {
 
     private final String id;
     private final String requestId;
-    private final String owner;
-    private final String team;
+    private String owner;
+    private String team;
     private final Instant createdAt;
     private final Duration ttl;
     private final int maxAttempts;
@@ -151,6 +151,25 @@ public class Lease {
 
     public boolean isExpiredAt(Instant now) {
         return status == LeaseStatus.READY && expiresAt != null && !now.isBefore(expiresAt);
+    }
+
+    /**
+     * 原地转让：仅 READY 且未到期的租约可转让。环境不重新供给、不换实例，
+     * endpoint / resourceSlot / expiresAt / ttl 全部保持不变；配额占用标志也保持占用，
+     * 配额的“源释放 + 目标占用”由编排服务在同一临界区内按维度原子搬运。
+     *
+     * <p>仅 owner 或 team 至少有一个发生变化时才应调用（完全相同的归属由服务层提前拒绝）。</p>
+     */
+    public void transferOwnership(String newOwner, String newTeam, Instant at) {
+        if (status != LeaseStatus.READY) {
+            throw new IllegalStateException("仅 READY 租约可转让，当前=" + status);
+        }
+        if (expiresAt == null || !at.isBefore(expiresAt)) {
+            throw new IllegalStateException("仅未到期租约可转让，at=" + at + " expiresAt=" + expiresAt);
+        }
+        this.owner = newOwner;
+        this.team = newTeam;
+        this.lastStatusChangedAt = at;
     }
 
     /** 占用配额（申请受理时调用）。 */

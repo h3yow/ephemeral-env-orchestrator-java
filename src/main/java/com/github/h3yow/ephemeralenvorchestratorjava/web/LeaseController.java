@@ -6,6 +6,7 @@ import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.ApplyLeaseRequest;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.LeaseView;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.OperationRequest;
 import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.RenewRequest;
+import com.github.h3yow.ephemeralenvorchestratorjava.web.dto.TransferRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -52,6 +53,11 @@ public class LeaseController {
     @PostMapping("/{id}/retry")
     public LeaseView retry(@PathVariable String id, @Valid @RequestBody OperationRequest request) {
         return service.retry(id, request.getOperator());
+    }
+
+    @PostMapping("/{id}/transfer")
+    public LeaseView transfer(@PathVariable String id, @Valid @RequestBody TransferRequest request) {
+        return service.transfer(id, request);
     }
 
     @GetMapping("/quotas/owners/{owner}")

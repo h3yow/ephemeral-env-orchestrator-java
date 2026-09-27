@@ -93,6 +93,74 @@ class LeaseControllerIntegrationTest {
     }
 
     @Test
+    @DisplayName("HTTP 转让：成功 200 且原地易主；同键重复提交结论一致；键冲突/非归属者/配额原因可区分")
+    void httpTransferAndIdempotencyConflicts() throws Exception {
+        MvcResult created = mvc().perform(post("/api/leases")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(applyJson("http-tr", "alice", "payments")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("READY"))
+                .andReturn();
+        String id = om.readTree(created.getResponse().getContentAsString()).get("id").asText();
+
+        String transferBody = """
+                {"requestId":"tr-key-1","operator":"alice","targetOwner":"bob","targetTeam":"platform"}
+                """;
+        MvcResult moved = mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(transferBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.owner").value("bob"))
+                .andExpect(jsonPath("$.team").value("platform"))
+                .andExpect(jsonPath("$.status").value("READY"))
+                .andReturn();
+        String endpointBefore = om.readTree(moved.getResponse().getContentAsString())
+                .get("endpoint").asText();
+        log.info("HTTP 转让成功 id={} -> bob/platform", id);
+
+        // 同键重复提交：结论一致（仍是同一条环境），不重复占用
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON).content(transferBody))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.owner").value("bob"))
+                .andExpect(jsonPath("$.endpoint").value(endpointBefore));
+
+        // 同键换目标归属 -> 409 IDEMPOTENCY_KEY_CONFLICT
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"tr-key-1","operator":"bob","targetOwner":"carol","targetTeam":"infra"}
+                                """))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("IDEMPOTENCY_KEY_CONFLICT"))
+                .andDo(r -> log.info("同键换目标 -> 409: {}", r.getResponse().getContentAsString()));
+
+        // 原归属者再操作 -> 409 NOT_OWNER
+        mvc().perform(post("/api/leases/{id}/terminate", id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"operator":"alice"}"""))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("NOT_OWNER"));
+
+        // 新归属者终止成功
+        mvc().perform(post("/api/leases/{id}/terminate", id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"operator":"bob"}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("TERMINATED"));
+
+        // 已终止再转让 -> 409 LEASE_ALREADY_TERMINATED
+        mvc().perform(post("/api/leases/{id}/transfer", id)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"requestId":"tr-key-2","operator":"bob","targetOwner":"dave","targetTeam":"infra"}
+                                """))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("LEASE_ALREADY_TERMINATED"));
+    }
+
+    @Test
     @DisplayName("HTTP 拒绝原因可区分：校验 400、不存在 404、跨所有者 409/NOT_OWNER")
     void httpErrorCodesDistinguishable() throws Exception {
         // 缺字段 -> 400
