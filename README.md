@@ -8,7 +8,7 @@
 ## 1. 快速运行
 
 ```bash
-# 构建并运行全部测试（55 个用例，覆盖并发/幂等/竞态/配额边界/转让/配置）
+# 构建并运行全部测试（61 个用例，覆盖并发/幂等/竞态/配额边界/转让/配置）
 mvn test
 
 # 启动服务（默认端口 8080）
@@ -125,14 +125,49 @@ POST /api/leases/{id}/transfer
 
 **并发下保证什么**
 
-转让与续租、终止、到期回收都走同一把全局锁串行裁决，任何时刻只有一个确定结论：
+转让与续租、终止、到期回收都走同一把全局锁串行裁决，任意两个操作打到同一条环境上时，
+临界区按某个确定顺序线性化，**无论线程谁先谁后、跑多少遍，最终只有一个确定结论**：
 
-- 已结束（TERMINATED/EXPIRED）的环境绝不可能再被转走；后来的转让拿到明确的终态拒绝码。
-- 转让未成功时，目标配额绝不被占用（“配额被吞”不可能发生）。
-- 到期边界上转让与回收并发：租约被原子回收，所有转让以 `LEASE_ALREADY_EXPIRED` 失败，
-  状态翻转全局至多一次。
+- **只有一个确定结论，绝不摇摆**：同一条环境上转让与终止并发时，要么转让先生效（环境原地
+  归 bob 且仍 READY，随后原 owner 的终止/续租/再转让一律 `NOT_OWNER`），要么终止先生效
+  （环境 TERMINATED，随后一切转让拿到明确的 `LEASE_ALREADY_TERMINATED`）。两个结局由
+  锁的线性化顺序唯一决定，不存在第三种中间态，也不会“这次红下次绿”。
+- **已结束环境不可转让**：TERMINATED/EXPIRED 的环境绝不可能再被转走；迟到的转让拿到
+  明确的终态拒绝码（`LEASE_ALREADY_TERMINATED` / `LEASE_ALREADY_EXPIRED`），归属与状态
+  不会被“复活”或改写。
+- **配额守恒（不被占用也不被吞掉）**：转让成功 = 源释放 + 目标占用 + 归属改写 + 幂等登记，
+  在同一临界区内一次完成，两级配额随归属一起迁移；转让没成功时，源不释放、目标不占用，
+  两边水位纹丝不动。到期回收发生在转让之后时，释放的是**接手方**的 owner/team 配额，
+  源侧配额不会被二次释放（计数不串账、不为负）。
+- **到期边界上转让与回收并发**：`now >= expiresAt` 时租约被原子回收，所有转让以
+  `LEASE_ALREADY_EXPIRED` 失败，READY→EXPIRED 全局至多翻转一次；`now < expiresAt` 时
+  转让可以成功，延长后的到期时间随环境一起交接。
+- **被拒续租绝不延长环境**：易主前后，非当前 owner 的续租一律 `NOT_OWNER` 且不留下任何
+  延长效果；最终到期时间只由真正生效的续租次数决定。
 - 一轮并发压测结束后，每个 owner、每个 team 的账本占用水位都与其**名下仍存活
   （`quotaHeld`）的环境数严格相等**，资源槽数量同样对得上（见 `TransferConcurrencyTest`）。
+
+以上每条保证都有两层自动化用例钉住：
+
+1. **确定性交错用例**（`TransferRaceOrderingTest`，借助 `RaceDirector` 逐线程放行）：
+   把“转让→终止 / 终止→转让”“续租→转让 / 转让→续租”“回收→转让 / 转让→回收”六种
+   线性化顺序分别构造出来，逐字段断言归属、两级配额、资源槽、到期时间，以及旧 owner 被挡、
+   新 owner 能续租/终止。顺序由用例精确指定，因此能**稳定复现**每一种结论，不依赖调度。
+2. **万箭齐发压测**（`TransferConcurrencyTest`）：24 线程同时发起，断言**无论谁赢**
+   不变量都成立；`transferVsTerminate` 内部重复 15 轮，两个分支都会被实际命中并校验。
+
+本地反复验证（两种顺序/两个分支都跑到、且每次结论一致）：
+
+```bash
+# 确定性交错：六种线性化顺序逐字段断言，毫秒级、零调度依赖
+mvn test -Dtest=TransferRaceOrderingTest
+
+# 随机顺序压测：转让×终止/续租/回收 + 600 轮混合压测，断言任意顺序下不变量
+mvn test -Dtest=TransferConcurrencyTest
+
+# 想专门把某个竞态用例反复跑（例如连跑 20 遍确认不红）：
+for i in $(seq 1 20); do mvn test -Dtest=TransferConcurrencyTest#transferVsTerminate || break; done
+```
 
 ---
 
@@ -243,7 +278,8 @@ mvn test
 | `TransferSuccessTest` | 转让后归属/配额迁移、环境原地不变（不重新供给/不换实例）、新 owner 可续租终止且原 owner 被挡、相同维度不重复计数、往返守恒、水位对账 |
 | `TransferRejectTest` | 非归属者/目标 owner 或 team 配额满/非 READY/已终止/已到期/不存在/空转让等拒绝原因彼此可区分，且拒绝后两边水位不动 |
 | `TransferIdempotencyTest` | 同键串行与 24 线程并发只生效一次、目标配额不重复占用；同键换环境/换目标 `IDEMPOTENCY_KEY_CONFLICT` 且信息可追溯；被拒不消费键 |
-| `TransferConcurrencyTest` | 转让 vs 终止/到期回收/续租的确定结论；600 轮混合并发（申请/转让/续租/终止/回收）后逐 owner、逐 team 水位与存活环境数严格对账 |
+| `TransferConcurrencyTest` | 转让 vs 终止（15 轮把两个线性化分支都跑实）：成功分支验证原地易主+两级配额迁移+旧 owner 被挡/新 owner 能续租终止，失败分支验证各方配额不动；转让 vs 到期边界：原子回收、翻转至多一次、配额不被吞；转让 vs 续租：续租成功/拒绝计数守恒、到期时间只被生效续租推动；600 轮混合并发（申请/转让/续租/终止/回收）后逐 owner、逐 team 水位与存活环境数严格对账 |
+| `TransferRaceOrderingTest` | 用 `RaceDirector` 逐线程放行的**确定性交错**：转让↔终止、续租↔转让、回收↔转让六种线性化顺序分别钉死，每种结论（谁赢、归属、两级配额、资源槽、到期时间、后续操作权限）逐字段断言，稳定复现、零调度依赖 |
 | `ConfigurationValidationTest` / `InvalidConfigBootRejectTest` | 默认值稳定、非法/矛盾配置启动期拒绝 |
 | `LeaseControllerIntegrationTest` | HTTP 状态码与稳定 errorCode、端到端幂等 |
 

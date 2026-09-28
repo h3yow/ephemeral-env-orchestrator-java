@@ -82,7 +82,16 @@ class TransferConcurrencyTest {
     @Test
     @DisplayName("转让 vs 终止同时发生：二选一确定胜出，绝不出现 TERMINATED 环境仍被转走或配额被吞")
     void transferVsTerminate() throws Exception {
-        LeaseView env = apply("race-t", "alice", "teamA");
+        // 重复多轮：两个线性化分支（转让先 / 终止先）都可能被调度命中，
+        // 无论命中哪个分支，下列强断言都必须成立——这正是“跑多少遍都稳定”的含义。
+        for (int round = 0; round < 15; round++) {
+            runTransferVsTerminateOnce(round);
+        }
+    }
+
+    private void runTransferVsTerminateOnce(int round) throws Exception {
+        LeaseView env = apply("race-t-" + round, "alice", "teamA");
+        int provisionSuccessAtStart = harness.provisioner.getSuccessCount();
         int threads = 24;
         ConcurrentLinkedQueue<LeaseView> transferOk = new ConcurrentLinkedQueue<>();
         ConcurrentLinkedQueue<ErrorCode> rejects = new ConcurrentLinkedQueue<>();
@@ -92,7 +101,7 @@ class TransferConcurrencyTest {
             try {
                 if (idx % 2 == 0) {
                     transferOk.add(harness.service.transfer(env.id(),
-                            transfer("race-t-" + idx, "alice", "bob", "teamB")));
+                            transfer("race-t-" + round + "-" + idx, "alice", "bob", "teamB")));
                 } else {
                     LeaseView v = harness.service.terminate(env.id(), "alice");
                     if (v.status() == LeaseStatus.TERMINATED) {
@@ -105,37 +114,127 @@ class TransferConcurrencyTest {
         });
 
         LeaseView finalState = harness.service.get(env.id());
-        log.info("判定结果：终态={} 转让成功线程数={} 终止成功次数={} 拒绝码={}",
-                finalState.status(), transferOk.size(), terminates.get(),
+        log.info("round={} 判定结果：终态={} 转让成功次数={} 终止成功次数={} 拒绝码={}",
+                round, finalState.status(), transferOk.size(), terminates.get(),
                 rejects.stream().distinct().toList());
 
         if (finalState.status() == LeaseStatus.TERMINATED) {
-            // 终止先胜出：所有转让必须被拒，且只能是 LEASE_ALREADY_TERMINATED
-            assertTrue(transferOk.isEmpty(), "判定依据：已结束环境绝不能被转走");
-            assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.LEASE_ALREADY_TERMINATED),
-                    "实际=" + rejects.stream().distinct().toList());
-            assertEquals(1, terminates.get());
-            assertEquals(0L, harness.ledger.ownerView("alice").used());
-            assertEquals(0L, harness.ledger.ownerView("bob").used(),
-                    "判定依据：转让未成功则目标配额绝不能被占用（配额不被吞）");
-            assertEquals(0L, harness.ledger.teamView("teamB").used());
+            assertTerminateWonRace(env, finalState, transferOk, rejects, terminates,
+                    provisionSuccessAtStart);
         } else {
-            // 转让先胜出：环境归属 bob/teamB 且仍 READY；之后 alice 的终止全部 NOT_OWNER
-            assertEquals(LeaseStatus.READY, finalState.status());
-            assertEquals("bob", finalState.owner());
-            assertEquals("teamB", finalState.team());
-            assertEquals(threads / 2, transferOk.size(),
-                    "判定依据：每个转让线程使用独立 requestId，转让在终止前发生则全部成功");
-            assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.NOT_OWNER),
-                    "判定依据：易主后原归属者终止被 NOT_OWNER 拒绝，实际="
-                            + rejects.stream().distinct().toList());
-            assertEquals(0, terminates.get());
-            assertEquals(1L, harness.ledger.ownerView("bob").used());
-            assertEquals(0L, harness.ledger.ownerView("alice").used());
+            assertTransferWonRace(env, finalState, transferOk, rejects, terminates,
+                    provisionSuccessAtStart);
         }
-        int expectedSlots = finalState.status() == LeaseStatus.TERMINATED ? 0 : 1;
-        assertEquals(expectedSlots, harness.provisioner.getOccupiedCount(),
-                "判定依据：资源槽与终态一致，不泄漏");
+    }
+
+    /** 终止先线性化：环境留在 alice 名下并 TERMINATED，转让一次都不能生效，配额/资源槽全部归零。 */
+    private void assertTerminateWonRace(LeaseView env, LeaseView finalState,
+                                        ConcurrentLinkedQueue<LeaseView> transferOk,
+                                        ConcurrentLinkedQueue<ErrorCode> rejects,
+                                        AtomicInteger terminates, int provisionSuccessAtStart) {
+        // 终止先胜出：所有转让必须被拒，且只能是 LEASE_ALREADY_TERMINATED
+        assertTrue(transferOk.isEmpty(), "判定依据：已结束环境绝不能被转走");
+        assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.LEASE_ALREADY_TERMINATED),
+                "实际=" + rejects.stream().distinct().toList());
+        assertEquals(1, terminates.get(), "判定依据：READY->TERMINATED 全局只能翻转一次");
+        // 被拒转让不得改动归属：终止不换 owner，环境仍挂在 alice/teamA 名下（已是终态）
+        assertEquals("alice", finalState.owner(), "判定依据：转让失败时归属纹丝不动");
+        assertEquals("teamA", finalState.team());
+        assertEquals(0L, harness.ledger.ownerView("alice").used());
+        assertEquals(0L, harness.ledger.ownerView("bob").used(),
+                "判定依据：转让未成功则目标 owner 配额绝不能被占用（配额不被吞）");
+        assertEquals(0L, harness.ledger.teamView("teamA").used());
+        assertEquals(0L, harness.ledger.teamView("teamB").used(),
+                "判定依据：转让未成功则目标 team 配额绝不能被占用（配额不被吞）");
+        assertEquals(0, harness.provisioner.getOccupiedCount(),
+                "判定依据：终止已释放唯一资源槽，不泄漏");
+        assertEquals(0, harness.provisioner.getSuccessCount() - provisionSuccessAtStart,
+                "判定依据：失败路径绝不能触发重新供给");
+
+        // 后续操作校验：旧归属者只能拿到终态拒绝；未接手成功的 bob 连归属校验都过不了；
+        // 环境不可能被一次迟到的转让“复活”或转走。
+        BusinessException aliceRenew = assertThrows(BusinessException.class,
+                () -> harness.service.renew(env.id(), renewRequest("alice", "PT2M")));
+        assertEquals(ErrorCode.LEASE_ALREADY_TERMINATED, aliceRenew.getCode());
+        BusinessException aliceTransfer = assertThrows(BusinessException.class,
+                () -> harness.service.transfer(env.id(), transfer("late-a", "alice", "bob", "teamB")));
+        assertEquals(ErrorCode.LEASE_ALREADY_TERMINATED, aliceTransfer.getCode());
+        BusinessException bobRenew = assertThrows(BusinessException.class,
+                () -> harness.service.renew(env.id(), renewRequest("bob", "PT2M")));
+        assertEquals(ErrorCode.NOT_OWNER, bobRenew.getCode(),
+                "判定依据：转让未生效，bob 自始至终不是归属者");
+        BusinessException bobTransfer = assertThrows(BusinessException.class,
+                () -> harness.service.transfer(env.id(), transfer("late-b", "bob", "carol", "teamC")));
+        assertEquals(ErrorCode.NOT_OWNER, bobTransfer.getCode());
+        assertEquals(LeaseStatus.TERMINATED, harness.service.get(env.id()).status());
+        // 被拒操作之后水位仍全部归零
+        assertEquals(0L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.teamView("teamB").used());
+    }
+
+    /** 转让先线性化：恰好一次转让原地生效，之后原归属者的一切操作被 NOT_OWNER 挡下。 */
+    private void assertTransferWonRace(LeaseView env, LeaseView finalState,
+                                       ConcurrentLinkedQueue<LeaseView> transferOk,
+                                       ConcurrentLinkedQueue<ErrorCode> rejects,
+                                       AtomicInteger terminates, int provisionSuccessAtStart) {
+        // 转让先胜出：第一个拿到锁的转让把环境转给 bob；此后其余 alice 的转让/终止全部 NOT_OWNER。
+        assertEquals(LeaseStatus.READY, finalState.status());
+        assertEquals(1, transferOk.size(),
+                "判定依据：只有第一个线性化的转让能生效；易主后其余转让以 NOT_OWNER 被拒，"
+                        + "绝不是“全部转让各成功一次”");
+        LeaseView moved = transferOk.peek();
+        assertEquals(env.id(), moved.id(), "判定依据：环境原地易主，id 不变（不重新供给）");
+        assertEquals(env.endpoint(), moved.endpoint(), "判定依据：endpoint/实例不变");
+        assertEquals(env.expiresAt(), moved.expiresAt(), "判定依据：转让不改变到期时间");
+        assertEquals("bob", finalState.owner());
+        assertEquals("teamB", finalState.team());
+        assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.NOT_OWNER),
+                "判定依据：易主后原归属者的转让/终止全部 NOT_OWNER，实际="
+                        + rejects.stream().distinct().toList());
+        assertEquals(0, terminates.get(), "判定依据：原归属者的终止一次都不能生效");
+        // 各级配额随归属一起迁移：源 owner/team 归零，目标 owner/team 各计 1
+        assertEquals(1L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.ownerView("alice").used());
+        assertEquals(1L, harness.ledger.teamView("teamB").used());
+        assertEquals(0L, harness.ledger.teamView("teamA").used());
+        assertEquals(1, harness.provisioner.getOccupiedCount(),
+                "判定依据：资源槽仍是原来那一个，不换实例");
+        assertEquals(0, harness.provisioner.getSuccessCount() - provisionSuccessAtStart,
+                "判定依据：转让不触发重新供给");
+
+        // 旧归属者后续操作被挡
+        BusinessException aliceRenew = assertThrows(BusinessException.class,
+                () -> harness.service.renew(env.id(), renewRequest("alice", "PT2M")));
+        assertEquals(ErrorCode.NOT_OWNER, aliceRenew.getCode());
+        BusinessException aliceTerminate = assertThrows(BusinessException.class,
+                () -> harness.service.terminate(env.id(), "alice"));
+        assertEquals(ErrorCode.NOT_OWNER, aliceTerminate.getCode());
+        BusinessException aliceTransfer = assertThrows(BusinessException.class,
+                () -> harness.service.transfer(env.id(), transfer("late-a2", "alice", "carol", "teamC")));
+        assertEquals(ErrorCode.NOT_OWNER, aliceTransfer.getCode());
+        // 归属与水位未被这些失败操作改动
+        assertEquals("bob", harness.service.get(env.id()).owner());
+        assertEquals(1L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.ownerView("carol").used());
+
+        // 新归属者能正常续租（在原到期时间上延长），随后正常终止并释放全部配额与资源槽
+        LeaseView renewed = harness.service.renew(env.id(), renewRequest("bob", "PT2M"));
+        assertEquals("bob", renewed.owner());
+        assertEquals(env.expiresAt().plus(java.time.Duration.ofMinutes(2)), renewed.expiresAt(),
+                "判定依据：接手方在原到期时间基础上续租成功");
+        LeaseView terminated = harness.service.terminate(env.id(), "bob");
+        assertEquals(LeaseStatus.TERMINATED, terminated.status());
+        assertEquals(0L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.teamView("teamB").used());
+        assertEquals(0L, harness.ledger.ownerView("alice").used());
+        assertEquals(0, harness.provisioner.getOccupiedCount());
+    }
+
+    private static RenewRequest renewRequest(String operator, String extension) {
+        RenewRequest r = new RenewRequest();
+        r.setOperator(operator);
+        r.setExtension(extension);
+        return r;
     }
 
     @Test
@@ -173,21 +272,28 @@ class TransferConcurrencyTest {
         assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.LEASE_ALREADY_EXPIRED),
                 "判定依据：所有转让以明确的 LEASE_ALREADY_EXPIRED 拒绝，实际="
                         + rejects.stream().distinct().toList());
-        assertEquals(0L, harness.ledger.ownerView("alice").used());
-        assertEquals(0L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.ownerView("alice").used(),
+                "判定依据：到期释放的是原 owner 配额（本场景无人接手成功）");
+        assertEquals(0L, harness.ledger.ownerView("bob").used(),
+                "判定依据：目标 owner 配额绝不能被一次失败转让占用（配额不被吞）");
         assertEquals(0L, harness.ledger.teamView("teamA").used());
-        assertEquals(0L, harness.ledger.teamView("teamB").used(), "判定依据：配额未被转让吞掉");
+        assertEquals(0L, harness.ledger.teamView("teamB").used(),
+                "判定依据：目标 team 配额绝不能被一次失败转让占用（配额不被吞）");
+        assertFalse(finalState.quotaHeld(), "判定依据：EXPIRED 后 quotaHeld 必须为 false");
         assertEquals(0, harness.provisioner.getOccupiedCount());
+        assertEquals(1, harness.provisioner.getSuccessCount(),
+                "判定依据：转让/回收路径都不重新供给，供给次数仍为初始 1 次");
     }
 
     @Test
-    @DisplayName("边界前一刻转让 vs 续租 vs 回收：结论确定，续租/转让都只认当前归属者")
+    @DisplayName("边界前一刻转让 vs 续租 vs 回收：结论确定，续租/转让都只认当前归属者；被拒续租绝不延长环境")
     void transferVsRenewBeforeBoundary() throws Exception {
         LeaseView env = apply("race-ren", "alice", "teamA");
         harness.clock.set(Instant.parse("2026-09-22T00:09:59Z")); // 到期前 1 秒
         int threads = 24;
         ConcurrentLinkedQueue<LeaseView> transferOk = new ConcurrentLinkedQueue<>();
-        ConcurrentLinkedQueue<LeaseView> renewOk = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<String> renewOkOperators = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<String> renewRejectOperators = new ConcurrentLinkedQueue<>();
         ConcurrentLinkedQueue<ErrorCode> rejects = new ConcurrentLinkedQueue<>();
 
         raceOneLease(threads, env.id(), idx -> {
@@ -197,10 +303,19 @@ class TransferConcurrencyTest {
                             transfer("race-ren-" + idx, "alice", "bob", "teamB")));
                     // 续租方不知道归属会变化：一半以 alice、一半以 bob 尝试，两者恰有一个在任何时刻是 owner
                     case 1 -> {
+                        String operator = idx % 2 == 1 ? "alice" : "bob";
                         RenewRequest r = new RenewRequest();
-                        r.setOperator(idx % 2 == 1 ? "alice" : "bob");
+                        r.setOperator(operator);
                         r.setExtension("PT1M");
-                        renewOk.add(harness.service.renew(env.id(), r));
+                        try {
+                            harness.service.renew(env.id(), r);
+                            renewOkOperators.add(operator);
+                        } catch (BusinessException ex) {
+                            if (ex.getCode() == ErrorCode.NOT_OWNER) {
+                                renewRejectOperators.add(operator);
+                            }
+                            throw ex;
+                        }
                     }
                     default -> harness.service.reapExpired();
                 }
@@ -210,22 +325,51 @@ class TransferConcurrencyTest {
         });
 
         LeaseView finalState = harness.service.get(env.id());
-        log.info("判定结果：终态={} owner={} 转让成功={} 续租成功={} 拒绝码={} expiresAt={}",
-                finalState.status(), finalState.owner(), transferOk.size(), renewOk.size(),
+        long aliceRenewOk = renewOkOperators.stream().filter("alice"::equals).count();
+        long bobRenewOk = renewOkOperators.stream().filter("bob"::equals).count();
+        long aliceRenewRejected = renewRejectOperators.stream().filter("alice"::equals).count();
+        long bobRenewRejected = renewRejectOperators.stream().filter("bob"::equals).count();
+        log.info("判定结果：终态={} owner={} 转让成功={} 续租成功(alice={},bob={}) "
+                        + "续租NOT_OWNER(alice={},bob={}) 拒绝码={} expiresAt={}",
+                finalState.status(), finalState.owner(), transferOk.size(),
+                aliceRenewOk, bobRenewOk, aliceRenewRejected, bobRenewRejected,
                 rejects.stream().distinct().toList(), finalState.expiresAt());
 
-        // 未到期：回收不得翻转；最终要么已转给 bob，要么仍属 alice，但状态恒 READY 且配额守恒。
+        // 未到期：回收不得翻转；所有 8 个转让都以 alice 身份发起，第一个线性化的转让必然成功，
+        // 故最终 owner 确定为 bob、状态恒 READY。
         assertEquals(LeaseStatus.READY, finalState.status());
-        assertTrue(transferOk.size() <= 1,
-                "判定依据：多个独立 requestId 的转让中，仅当第一次发生时有效；"
-                        + "易主后其余转让以 NOT_OWNER 拒绝，实际成功=" + transferOk.size());
+        assertEquals("bob", finalState.owner(),
+                "判定依据：8 个转让均由当前唯一可转让者 alice 发起，第一个必然生效，归属确定 bob");
+        assertEquals(1, transferOk.size(),
+                "判定依据：只有第一个线性化的转让生效；其余转让（以及易主后的全部 alice 操作）NOT_OWNER");
         assertTrue(rejects.stream().allMatch(c -> c == ErrorCode.NOT_OWNER),
                 "判定依据：未到期不会有过期类拒绝；所有拒绝只能来自归属校验，实际="
                         + rejects.stream().distinct().toList());
-        String owner = finalState.owner();
-        assertEquals(1L, harness.ledger.ownerView(owner).used());
-        assertEquals(0L, harness.ledger.ownerView(owner.equals("bob") ? "alice" : "bob").used());
+
+        // 续租账本（线程布局：8 个续租线程，alice/bob 各 4）：
+        //  - alice 的 4 次续租：转让前 owner=alice 可能成功，转让后必 NOT_OWNER；
+        //    成功 + 拒绝恒为 4，且任何成功只可能发生在转让之前。
+        //  - bob 的 4 次续租：转让前必 NOT_OWNER，转让后成功；成功 + 拒绝恒为 4。
+        assertEquals(4, aliceRenewOk + aliceRenewRejected, "判定依据：alice 续租总数守恒为 4");
+        assertEquals(4, bobRenewOk + bobRenewRejected, "判定依据：bob 续租总数守恒为 4");
+        assertEquals(8, renewOkOperators.size() + renewRejectOperators.size(),
+                "判定依据：8 次续租要么成功要么 NOT_OWNER，无第三种结局");
+
+        // 到期时间精确对账：被拒的续租绝不延长环境；每次成功续租在当前到期时间上叠加 1 分钟。
+        // 初始 expiresAt=00:10；alice 的成功续租只可能在转让前，bob 的成功续租只可能在转让后，
+        // 无论线性化细节如何，最终 expiresAt 严格等于 00:10 + 成功续租总次数。
+        assertEquals(env.expiresAt().plus(java.time.Duration.ofMinutes(renewOkOperators.size())),
+                finalState.expiresAt(),
+                "判定依据：到期时间只能被成功续租推动，被 NOT_OWNER 拒绝的续租不得留下任何延长效果");
+
+        // 两级配额与归属一致，资源槽仍是原来那一个
+        assertEquals(1L, harness.ledger.ownerView("bob").used());
+        assertEquals(0L, harness.ledger.ownerView("alice").used());
+        assertEquals(1L, harness.ledger.teamView("teamB").used());
+        assertEquals(0L, harness.ledger.teamView("teamA").used());
         assertEquals(1, harness.provisioner.getOccupiedCount());
+        assertEquals(0, harness.provisioner.getSuccessCount() - 1,
+                "判定依据：转让/续租/回收都不触发重新供给");
     }
 
     @Test
